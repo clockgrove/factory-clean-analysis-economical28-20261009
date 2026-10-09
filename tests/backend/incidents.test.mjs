@@ -35,6 +35,30 @@ function expected(rows, options = {}) {
   return { found, summary: { total: found.length, unresolved, highSeverity, openedByDay: Object.keys(counts).sort().map(date => ({ date, count: counts[date] })) } };
 }
 
+function expectedOverview(rows, options = {}) {
+  const services = new Map();
+  for (const row of expected(rows, options).found) {
+    let measure = services.get(row.service);
+    if (!measure) {
+      measure = { service: row.service, total: 0, unresolved: 0, highSeverity: 0, resolutionHours: 0, resolved: 0 };
+      services.set(row.service, measure);
+    }
+    measure.total++;
+    if (row.status !== 'resolved') measure.unresolved++;
+    if (row.severity === 'critical' || row.severity === 'high') measure.highSeverity++;
+    if (row.resolvedAt !== null) {
+      measure.resolutionHours += (Date.parse(row.resolvedAt) - Date.parse(row.openedAt)) / 3600000;
+      measure.resolved++;
+    }
+  }
+  return [...services.values()]
+    .sort((a, b) => b.unresolved - a.unresolved || (a.service < b.service ? -1 : a.service > b.service ? 1 : 0))
+    .map(({ service, total, unresolved, highSeverity, resolutionHours, resolved }) => ({
+      service, total, unresolved, highSeverity,
+      averageResolutionHours: resolved ? resolutionHours / resolved : null,
+    }));
+}
+
 function query(options) {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(options)) {
@@ -96,6 +120,13 @@ test('canonical incidents through real loopback HTTP', async t => {
       assert.deepEqual(actual, { items: found.slice((page - 1) * pageSize, page * pageSize), page, pageSize, total: found.length, totalPages, summary });
       return actual;
     };
+    const checkOverview = async (options = {}) => {
+      const response = await fetch(`${base}/api/overview?${query(options)}`);
+      assert.equal(response.status, 200);
+      const actual = await response.json();
+      assert.deepEqual(actual, { services: expectedOverview(rows, options) });
+      return actual;
+    };
 
     await t.test('defaults and whole-result summaries', async () => {
       const body = await checkList();
@@ -136,6 +167,25 @@ test('canonical incidents through real loopback HTTP', async t => {
     });
     await t.test('pagination bounds, page sizes and empty results', async () => {
       for (const options of [{ page: 2 }, { pageSize: 50, page: 2 }, { page: 999999 }, { pageSize: 50, page: 48 }, { q: 'no such incident', page: 300 }]) await checkList(options);
+    });
+    await t.test('whole-result service overview filters, ordering and pagination invariance', async () => {
+      const filters = { q: 'incident', service: ['Billing', 'Notifications'], status: ['open', 'in_progress', 'resolved'], severity: ['critical', 'high', 'medium'], from: '2026-04-15', to: '2026-06-13' };
+      assert.ok(expected(rows, filters).found.length > 50, 'combined filters span multiple pages');
+      const firstPage = await checkOverview({ ...filters, page: 1, pageSize: 25 });
+      assert.deepEqual(await checkOverview({ ...filters, page: 2, pageSize: 25 }), firstPage);
+      assert.deepEqual(await checkOverview({ ...filters, page: 2, pageSize: 50, sort: 'severity', direction: 'asc' }), firstPage);
+
+      const unresolved = await checkOverview({ status: ['open', 'in_progress'], page: 3, pageSize: 50 });
+      assert.ok(unresolved.services.length > 0);
+      assert.ok(unresolved.services.every(service => service.averageResolutionHours === null));
+      const empty = await checkOverview({ q: 'no such incident matches this', page: 99 });
+      assert.deepEqual(empty, { services: [] });
+
+      for (const params of ['page=0', 'pageSize=100', 'sort=id', 'direction=down']) {
+        const response = await fetch(`${base}/api/overview?${params}`);
+        assert.equal(response.status, 400, params);
+        assert.equal((await response.json()).error.code, 'INVALID_QUERY');
+      }
     });
     await t.test('complete details and useful errors without mutations', async () => {
       for (const row of [rows[0], rows.find(row => row.resolvedAt !== null), rows.at(-1)]) {
