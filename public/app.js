@@ -1,4 +1,5 @@
-import {createState, transition, queryParams, savedView, announcement, isResultCurrent, canPaginate, addressIntent} from './state.js';
+import {createState, transition, queryParams, overviewParams, overviewIdentity, overviewIntent, savedView, announcement, isResultCurrent, canPaginate, addressIntent} from './state.js';
+import {loadTriage, saveTriage, addTriageEntry, updateTriageNote, removeTriageEntry} from './triage.js';
 
 const $ = id => document.getElementById(id);
 const node = (tag, text, className) => { const element = document.createElement(tag); if (text !== undefined) element.textContent = text; if (className) element.className = className; return element; };
@@ -10,15 +11,19 @@ function writeAddress(method) {
   history[method](null, '', `${location.pathname}?${queryParams(state.intent)}${location.hash}`);
 }
 writeAddress('replaceState');
-let resultController, detailController, exportController;
+let resultController, overviewController, detailController, exportController;
 let returnIncident = null, returnElement = null;
-let renderedResult, renderedBlocked, renderedDetail, renderedIntent;
+let renderedResult, renderedBlocked, renderedDetail, renderedIntent, renderedOverview, renderedOverviewCurrent, renderedTriageVersion = -1, triageRenderVersion = 0;
 const storageKey = 'incident-explorer.views.v1';
 let views = [];
 try {
   const stored = JSON.parse(localStorage.getItem(storageKey) || '[]');
   if (Array.isArray(stored)) views = stored.filter(v => v && typeof v.name === 'string' && v.view && typeof v.view === 'object').map(v => ({name: v.name.slice(0, 80), view: savedView(v.view)}));
 } catch { $('storage-message').textContent = 'Saved views could not be read. You can still explore incidents.'; }
+let triageEntries = [], triageStorageStatus = '';
+try { ({entries: triageEntries, status: triageStorageStatus} = loadTriage(localStorage)); }
+catch { triageStorageStatus = 'Browser storage is unavailable. Triage will last only for this visit unless storage becomes available.'; }
+function triageStorage() { try { return window.localStorage; } catch { return null; } }
 
 function dispatch(event) { const next = transition(state, event); if (next === state) return; state = next; render(); }
 function restoreFocus() {
@@ -33,12 +38,13 @@ function closeDetail() {
 function change(event) {
   const next = transition(state, event);
   if (next === state) return;
+  const overviewChanged = next.overviewOp.identity !== state.overviewOp.identity;
   $('to').setCustomValidity('');
-  resultController?.abort(); detailController?.abort(); exportController?.abort();
+  resultController?.abort(); if (overviewChanged) overviewController?.abort(); detailController?.abort(); exportController?.abort();
   state = next;
   if (event.type === 'address') { $('search').value = state.intent.q; renderedIntent = undefined; writeAddress('replaceState'); }
   else writeAddress('pushState');
-  render(); loadResults();
+  render(); loadResults(); if (overviewChanged) loadOverview();
 }
 async function checked(response) {
   if (response.ok) return response;
@@ -60,6 +66,18 @@ async function loadResults() {
     if (ownsResult) writeAddress('replaceState');
   } catch (error) { if (error.name !== 'AbortError') dispatch({type: 'result:failure', token, error: errorText(error)}); }
   finally { dispatch({type: 'result:finish', token}); }
+}
+async function loadOverview() {
+  overviewController?.abort();
+  const controller = overviewController = new AbortController();
+  dispatch({type: 'overview:start'});
+  const token = state.overviewOp.token, identity = state.overviewOp.identity, params = overviewParams(state.intent);
+  try {
+    const response = await checked(await fetch(`/api/overview?${params}`, {signal: controller.signal}));
+    const data = await response.json();
+    dispatch({type: 'overview:success', token, identity, data});
+  } catch (error) { if (error.name !== 'AbortError') dispatch({type: 'overview:failure', token, identity, error: errorText(error)}); }
+  finally { dispatch({type: 'overview:finish', token, identity}); }
 }
 async function loadDetail() {
   detailController?.abort();
@@ -153,6 +171,66 @@ function renderSnapshot() {
   $('next').disabled = !canPaginate(state) || state.intent.page >= (data?.totalPages || 0);
   $('page-label').textContent = data ? data.totalPages ? `Page ${data.page} of ${data.totalPages} · ${data.total.toLocaleString()} incidents${current ? '' : ' (previous query)'}` : '0 incidents · no pages' : 'Pages unavailable';
 }
+function filterDescription(filters) {
+  const parts = [];
+  if (filters.q) parts.push(`search “${filters.q}”`);
+  for (const key of ['service', 'status', 'severity']) if (filters[key].length) parts.push(`${human(key)} ${filters[key].map(human).join(', ')}`);
+  if (filters.from) parts.push(`from ${filters.from} UTC`);
+  if (filters.to) parts.push(`through ${filters.to} UTC`);
+  return parts.length ? parts.join(' · ') : 'no search or filters';
+}
+function renderOverview() {
+  const currentIdentity = overviewIdentity(state.intent), snapshot = state.overview;
+  const current = !!snapshot && snapshot.identity === currentIdentity;
+  const pending = state.overviewOp.pending && state.overviewOp.identity === currentIdentity;
+  const error = state.overviewOp.error && state.overviewOp.identity === currentIdentity;
+  $('overview-selection').textContent = snapshot ? `${current ? 'Current selection' : 'Previous selection'}: ${filterDescription(snapshot.filters)}` : 'No completed selection yet';
+  $('overview-context').textContent = snapshot && !current ? `These measures describe the previous selection (${filterDescription(snapshot.filters)}); current selection is ${filterDescription(overviewIntent(state.intent))}.` : 'Measures cover all incidents matching the current search and filters.';
+  let message = '', retry = false;
+  if (error) { message = `Service overview failed for ${filterDescription(overviewIntent(state.intent))}: ${state.overviewOp.error}`; retry = true; }
+  else if (pending) message = current ? 'Refreshing service measures…' : 'Loading service measures for the current selection…';
+  else if (!snapshot) message = 'Service measures have not loaded yet.';
+  else if (current && !snapshot.data.services.length) message = 'No services match this selection. Try clearing a filter or changing the search.';
+  const messageElement = $('overview-message');
+  operationMessage(messageElement, message, retry ? loadOverview : null, !!error);
+  const rows = $('overview-rows');
+  if (snapshot !== renderedOverview || current !== renderedOverviewCurrent) {
+    renderedOverview = snapshot; renderedOverviewCurrent = current;
+    rows.replaceChildren();
+    for (const service of snapshot?.data.services || []) {
+      const average = service.averageResolutionHours === null ? 'Unavailable' : `${Number(service.averageResolutionHours).toLocaleString(undefined, {maximumFractionDigits: 2})} h`;
+      const row = node('tr');
+      for (const [label, value] of [['Service', service.service], ['Incidents', service.total.toLocaleString()], ['Unresolved', service.unresolved.toLocaleString()], ['Critical + high', service.highSeverity.toLocaleString()], ['Avg. resolution · hours', average]]) { const cell = node('td', value); cell.dataset.label = label; row.append(cell); }
+      rows.append(row);
+    }
+  }
+  $('overview').setAttribute('aria-busy', String(pending));
+}
+function persistTriage() {
+  const result = saveTriage(triageStorage(), triageEntries);
+  triageStorageStatus = result.status;
+  $('triage-storage-message').textContent = triageStorageStatus;
+}
+function renderTriage(force = false) {
+  $('triage-storage-message').textContent = triageStorageStatus;
+  if (!force && triageRenderVersion === renderedTriageVersion) return;
+  renderedTriageVersion = triageRenderVersion;
+  const list = $('triage-list'); list.replaceChildren();
+  if (!triageEntries.length) { list.append(node('li', 'No incidents in triage yet.', 'muted')); return; }
+  for (const entry of triageEntries) {
+    const item = node('li', undefined, 'triage-item'), heading = node('div', undefined, 'triage-item-heading');
+    const open = node('button', `${entry.incident.id} · ${entry.incident.title}`, 'triage-open secondary');
+    open.type = 'button'; open.setAttribute('aria-label', `Open details for ${entry.incident.id}, ${entry.incident.title}`);
+    open.addEventListener('click', () => { returnIncident = null; returnElement = open; dispatch({type: 'detail:select', id: entry.incident.id}); loadDetail(); });
+    const remove = node('button', `Remove ${entry.incident.id}`, 'secondary triage-remove'); remove.type = 'button'; remove.addEventListener('click', () => { triageEntries = removeTriageEntry(triageEntries, entry.incident.id); triageRenderVersion++; persistTriage(); renderTriage(); });
+    heading.append(open, remove);
+    const meta = node('p', `${entry.incident.service} · ${human(entry.incident.severity)} · ${human(entry.incident.status)}`, 'muted');
+    const label = node('label', `Note for ${entry.incident.id}`), note = node('textarea'); note.value = entry.note; note.maxLength = 1000; note.setAttribute('aria-label', `Note for ${entry.incident.id}`);
+    note.addEventListener('input', () => { triageEntries = updateTriageNote(triageEntries, entry.incident.id, note.value); persistTriage(); });
+    label.append(note);
+    item.append(heading, meta, label); list.append(item);
+  }
+}
 function renderDetail() {
   const detail = state.detail, dialog = $('detail');
   if (!detail.id) { renderedDetail = null; if (dialog.open) { dialog.close(); restoreFocus(); } return; }
@@ -169,13 +247,16 @@ function renderDetail() {
       const value = detail.data[key];
       fields.append(node('dt', label), node('dd', key.endsWith('At') ? utc(value) : Array.isArray(value) ? value.join(', ') || 'None' : key === 'status' ? human(value) : String(value ?? '—')));
     }
-    $('detail-content').append(fields);
+    const add = node('button', triageEntries.some(entry => entry.incident.id === detail.data.id) ? 'Already in triage' : 'Add to my triage list', 'secondary');
+    add.type = 'button'; add.disabled = triageEntries.some(entry => entry.incident.id === detail.data.id);
+    add.addEventListener('click', () => { const next = addTriageEntry(triageEntries, detail.data); if (next !== triageEntries) { triageEntries = next; triageRenderVersion++; } persistTriage(); renderedDetail = null; renderTriage(); renderDetail(); });
+    $('detail-content').append(fields, add);
   }
   if (!dialog.open) { dialog.showModal(); $('close-detail').focus(); }
   else if (contentHadFocus) $('close-detail').focus();
 }
 function render() {
-  renderControls(); renderSnapshot(); renderDetail();
+  renderControls(); renderSnapshot(); renderOverview(); renderTriage(); renderDetail();
   $('export').disabled = state.exportOp.pending;
   operationMessage($('export-message'), state.exportOp.error || (state.exportOp.pending ? 'Preparing a CSV of all matching incidents…' : ''), state.exportOp.error ? exportCSV : null, !!state.exportOp.error);
   $('announcement').textContent = announcement(state);
@@ -221,4 +302,4 @@ $('detail').addEventListener('cancel', event => { event.preventDefault(); closeD
 $('save-form').addEventListener('submit', event => { event.preventDefault(); const name = $('view-name').value.trim(); if (!name) { $('view-name').setCustomValidity('Enter a view name.'); $('view-name').reportValidity(); return; } views.push({name, view: savedView(state.intent)}); persistViews(); renderViews(); $('view-name').value = ''; });
 $('view-name').addEventListener('input', () => $('view-name').setCustomValidity(''));
 window.addEventListener('popstate', () => change({type: 'address', intent: addressIntent(new URLSearchParams(location.search))}));
-renderViews(); render(); loadResults();
+renderViews(); render(); loadResults(); loadOverview();
